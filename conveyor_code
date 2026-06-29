@@ -1,0 +1,29 @@
+function sysCall_init()
+    sim = require 'sim'
+    proxSensor = sim.getObject '/conveyor_sensor'
+    proxSensorW1 = sim.getObject '/wall1_sensor'
+    proxSensorW2 = sim.getObject '/wall2_sensor'
+    conveyor = sim.getObject '/conveyor'
+    sim.writeCustomTableData(conveyor, '__ctrl__', {vel = 0.01})
+end
+
+function sysCall_actuation()
+    local r = sim.readProximitySensor(proxSensor)
+    local r1 = sim.readProximitySensor(proxSensorW1)
+    local r2 = sim.readProximitySensor(proxSensorW2)
+
+    if r > 0 then
+        sim.writeCustomTableData(conveyor, '__ctrl__', {vel = 0})
+        sim.setIntegerSignal('rod_pickup', 1) 
+    end
+    if sim.getIntegerSignal('resume_conveyor') == 1 then
+        sim.writeCustomTableData(conveyor, '__ctrl__', {vel=0.01})
+        sim.clearIntegerSignal('resume_conveyor')
+    end
+    if r1 > 0 then
+        sim.setIntegerSignal('second_robot', 1)
+    end
+    if r2 > 0 then
+        sim.setIntegerSignal('third_robot', 1)
+    end
+end
