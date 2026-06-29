@@ -1,0 +1,160 @@
+sim=require'sim'
+simIK=require'simIK'
+
+-- move joints along a path, forward or backward
+function hopThroughConfigs(path, joints, reverse, dynModel)
+    if not path then return false end -- safety check
+    local lb = sim.setStepping(true)
+    local s, g, incr = 1, #path/6, 1
+    if reverse then s, g, incr = #path/6, 1, -1 end
+    for i=s, g, incr do
+        for j=1, #joints do
+            local val = path[(i-1)*6 + j]
+            if dynModel then sim.setJointTargetPosition(joints[j], val)
+            else sim.setJointPosition(joints[j], val)
+            end
+        end
+        sim.step() -- advance simulation
+    end
+    sim.setStepping(lb)
+    return true
+end
+
+function generatePathTo(targetPos, simBase, simTip, simGoal, simJoints)
+    sim.setObjectPosition(simGoal, -1, targetPos)
+    local ikEnv = simIK.createEnvironment()
+    local ikGroup = simIK.createGroup(ikEnv)
+    local ikElement, map = simIK.addElementFromScene(ikEnv, ikGroup, simBase, simTip, simGoal, simIK.constraint_position)
+    local ikTip = map[simTip]
+    local ikJ = {}
+    for i=1,#simJoints do ikJ[i] = map[simJoints[i]] end
+    local path = simIK.generatePath(ikEnv, ikGroup, ikJ, ikTip, 100)
+    simIK.eraseEnvironment(ikEnv)
+    return path
+end
+
+function waitForGrasp(left_sensor, right_sensor, timeout)
+    local startTime = sim.getSimulationTime()
+    while true do
+        local ldetect = sim.readProximitySensor(left_sensor)
+        local rdetect = sim.readProximitySensor(right_sensor)
+        
+        if ldetect > 0 and rdetect > 0 then
+            sim.addStatusbarMessage('[Robot2] Grasped fuel rod')
+            return true
+        end
+        
+        if timeout and (sim.getSimulationTime() - startTime > timeout) then
+            sim.addStatusbarMessage('[Robot2] Grasp timeout!')
+            return false
+        end
+        
+        sim.wait(0.05)
+    end
+end
+
+function sysCall_thread()
+    local simBase = sim.getObject('..')
+    local simTip = sim.getObject('/robot2/NiryoLGripper/tip')
+    local simGoal = sim.getObject('/dummy')
+    local simJoints = {}
+    for i=1,6 do
+        simJoints[i] = sim.getObject('../Joint', {index=i-1})
+    end
+    local connection = sim.getObject('../connection')
+    local gripper = sim.getObjectChild(connection, 0)
+    local gripperName = (gripper ~= -1) and sim.getObjectAlias(gripper,4) or 'NiryoNoGripper'
+    
+    local leftSensor = sim.getObject('/robot2/NiryoLGripper/leftSensor')
+    local rightSensor = sim.getObject('/robot2/NiryoLGripper/rightSensor')
+    
+    sim.step()
+    local dynModel = sim.isDynamicallyEnabled(simJoints[1])
+    
+    local fuelRod = sim.getObject('/fuelRod') -- object to pick
+    
+    -- predefined waypoints for path planning
+    local waypoints = {
+        home = {0.7757, 0.27508, 0.35783},
+        intermediate1 = {0.480, -0.00167, 0.32972},
+        intermediate2 = {0.7757, 0.27508, 0.35782},
+        handoff1 = {1.04918, -0.00167, 0.32972},
+        handoff2 = {1.120, -0.00167, 0.32972}
+    }
+    
+    sim.clearInt32Signal(gripperName..'_close')
+    sim.wait(1)
+    
+    while true do
+        sim.clearInt32Signal(gripperName..'_close')
+        sim.wait(1)
+        sim.addStatusbarMessage('[Robot2] Gripper open, ready')
+        
+        sim.addStatusbarMessage('[Robot2] Waiting for signal...')
+        while sim.getInt32Signal('second_robot') ~= 1 do
+            sim.wait(0.05)
+        end
+        
+        sim.clearInt32Signal('second_robot')
+        sim.addStatusbarMessage('[Robot2] Signal received! Moving to grab...')
+        
+        -- calculate grasp position relative to fuel rod
+        local rodPos = sim.getObjectPosition(fuelRod, -1)
+        local graspPos = {rodPos[1] + 0.1041, rodPos[2] - 0.00167, rodPos[3] - 0.02438}
+        
+        -- generate path and move to grasp
+        local pathToGrasp = generatePathTo(graspPos, simBase, simTip, simGoal, simJoints)
+        if pathToGrasp then
+            hopThroughConfigs(pathToGrasp, simJoints, false, dynModel)
+            sim.wait(0.5)
+            
+            sim.setInt32Signal(gripperName .. '_close', 1)
+            sim.wait(1.5)
+            
+            if waitForGrasp(leftSensor, rightSensor, 5) then
+                sim.setInt32Signal('second_robot_grabbed', 1)
+                sim.wait(0.5)
+                
+                -- move through intermediate waypoints
+                local path2 = generatePathTo(waypoints.intermediate1, simBase, simTip, simGoal, simJoints)
+                hopThroughConfigs(path2, simJoints, false, dynModel)
+                
+                local path3 = generatePathTo(waypoints.intermediate2, simBase, simTip, simGoal, simJoints)
+                hopThroughConfigs(path3, simJoints, false, dynModel)
+                
+                local path4 = generatePathTo(waypoints.handoff1, simBase, simTip, simGoal, simJoints)
+                hopThroughConfigs(path4, simJoints, false, dynModel)
+                
+                local path5 = generatePathTo(waypoints.handoff2, simBase, simTip, simGoal, simJoints)
+                hopThroughConfigs(path5, simJoints, false, dynModel)
+                
+                -- wait for robot3 to grasp
+                sim.addStatusbarMessage('[Robot2] Waiting for Robot3...')
+                while sim.getInt32Signal('third_robot_grabbed') ~= 1 do
+                    sim.wait(0.05)
+                end
+                
+                -- reset signals after handoff
+                sim.clearInt32Signal('third_robot_grabbed')
+                sim.clearInt32Signal(gripperName..'_close')
+                sim.clearInt32Signal('second_robot_grabbed')
+                sim.wait(1.5)  
+                
+                sim.addStatusbarMessage('[Robot2] Rod released!')
+            else
+                sim.addStatusbarMessage('[Robot2] Failed to grasp!')
+            end
+            
+            -- return home
+            local pathHome = generatePathTo(waypoints.home, simBase, simTip, simGoal, simJoints)
+            hopThroughConfigs(pathHome, simJoints, false, dynModel)
+            
+            sim.addStatusbarMessage('[Robot2] Returned home, ready for next cycle')
+        else
+            sim.addStatusbarMessage('[Robot2] Failed to generate path!')
+        end
+        
+        sim.clearInt32Signal(gripperName..'_close')
+        sim.wait(1)
+    end
+end
