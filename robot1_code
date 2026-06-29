@@ -1,0 +1,134 @@
+sim = require'sim'
+simIK = require'simIK'
+
+--moving the robot's joints through a path, forward or backward
+function hopThroughConfigs(path, joints, reverse, dynModel)
+    local lb = sim.setStepping(true)
+    local s, g, incr = 1, #path/6, 1
+    if reverse then s, g, incr = #path/6, 1, -1 end
+    for i=s, g, incr do
+        for j=1, #joints do
+            local val = path[(i-1)*6 + j]
+            if dynModel then sim.setJointTargetPosition(joints[j], val)
+            else sim.setJointPosition(joints[j], val)
+            end
+        end
+        sim.step() -- step simulation
+    end
+    sim.setStepping(lb)
+end
+
+--generate ik path to a target position
+function generatePathTo(targetPos, simBase, simTip, simGoal, simJoints)
+    sim.setObjectPosition(simGoal, -1, targetPos)
+    local ikEnv = simIK.createEnvironment()
+    local ikGroup = simIK.createGroup(ikEnv)
+    local ikElement, map = simIK.addElementFromScene(ikEnv, ikGroup, simBase, simTip, simGoal, simIK.constraint_position)
+    local ikTip = map[simTip]
+    local ikJ = {}
+    for i=1,#simJoints do ikJ[i] = map[simJoints[i]] end
+    local path = simIK.generatePath(ikEnv, ikGroup, ikJ, ikTip, 300)
+    simIK.eraseEnvironment(ikEnv)
+    return path
+end
+
+--wait until both sensors detect the rod and confirm grasp
+function grasp(left_sensor, right_sensor)
+    while true do
+        local ldetect = sim.readProximitySensor(left_sensor)
+        local rdetect = sim.readProximitySensor(right_sensor)
+        
+        if ldetect > 0 and rdetect > 0 then
+            sim.addStatusbarMessage('[Robot1] Grasped fuel rod')
+            sim.setInt32Signal('robot1_grabbed',1)
+            return true
+        end
+        sim.wait(0.05)
+    end
+end
+
+function sysCall_thread()
+    local simBase = sim.getObject('..')
+    local simTip = sim.getObject('/robot1/NiryoLGripper/tip')
+    local simGoal = sim.getObject('/r1')
+    
+    -- get robot joints
+    local simJoints = {}
+    for i=1,6 do
+        simJoints[i] = sim.getObject('../Joint', {index=i-1})
+    end
+    
+    local connection = sim.getObject('../connection')
+    local gripper = sim.getObjectChild(connection, 0)
+    local gripperName = (gripper ~= -1) and sim.getObjectAlias(gripper,4) or 'NiryoNoGripper'
+    local leftSensor = sim.getObject('/robot1/NiryoLGripper/leftSensor')
+    local rightSensor = sim.getObject('/robot1/NiryoLGripper/rightSensor')
+    
+    -- wait for second robot to grab its rod
+    local function R2Grab()
+        while sim.getIntegerSignal('second_robot') ~= 1 do
+            sim.wait(0.05)
+        end
+        while sim.getIntegerSignal('second_robot_grabbed') ~= 1 do
+            sim.wait(0.05)
+        end
+    end
+    
+    --wait until rod pickup is triggered
+    while true do
+        if sim.getIntegerSignal('stop_robot1') == 1 then
+            sim.addStatusbarMessage('[Robot1] No more rods will be picked')
+            break
+        end
+        
+        while sim.getIntegerSignal('rod_pickup') ~= 1 do
+            if sim.getIntegerSignal('stop_robot1') == 1 then break end
+            sim.wait(0.05)
+        end
+        sim.setIntegerSignal('rod_pickup', 0)
+        
+        local r, dist, point, detectedRod = sim.readProximitySensor(
+            sim.getObject('/conveyor_sensor')
+        )
+        
+        if r <= 0 then
+            sim.addStatusbarMessage('[Robot1] Warning: No rod detected')
+            sim.wait(0.1)
+            goto continue
+        end
+            
+        local rodPos = sim.getObjectPosition(detectedRod, -1)
+        local graspPos = {rodPos[1] + 0.0498, rodPos[2] - 0.0317, rodPos[3] - 0.0004}
+        local dynModel = sim.isDynamicallyEnabled(simJoints[1])
+        
+        sim.wait(5) -- small delay before moving
+
+        local PathA = generatePathTo(graspPos, simBase, simTip, simGoal, simJoints)
+        hopThroughConfigs(PathA, simJoints, false, dynModel)
+            
+        sim.setInt32Signal(gripperName .. '_close', 1)
+        sim.wait(10) -- wait for gripper to close
+        grasp(leftSensor, rightSensor)
+        
+        sim.setIntegerSignal('resume_conveyor', 1)
+        hopThroughConfigs(PathA, simJoints, true, dynModel) -- return path
+
+        -- move to drop positions
+        local path2 = generatePathTo({0.225, 0.0, 0.350},simBase, simTip, simGoal, simJoints)
+        hopThroughConfigs(path2, simJoints, false, dynModel)
+        local path3 = generatePathTo({0.260, 0.0, 0.350},simBase, simTip, simGoal, simJoints)
+        hopThroughConfigs(path3, simJoints, false, dynModel)
+
+        R2Grab() -- sync with robot2
+        sim.wait(0.2)
+        sim.clearInt32Signal(gripperName..'_close')
+
+        -- move back to default position
+        local default_pos = generatePathTo({-0.04931, 0.30602, 0.37816},simBase, simTip, simGoal, simJoints)
+        hopThroughConfigs(default_pos, simJoints, false, dynModel)
+        
+        sim.wait(0.2)
+        
+        ::continue::
+    end
+end
