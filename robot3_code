@@ -1,0 +1,160 @@
+sim=require'sim'
+simIK=require'simIK'
+
+function hopThroughConfigs(path, joints, reverse, dynModel)
+    local lb = sim.setStepping(true)
+    local s, g, incr = 1, #path/6, 1
+    if reverse then s, g, incr = #path/6, 1, -1 end
+
+    for i=s, g, incr do
+        for j=1, #joints do
+            local val = path[(i-1)*6 + j]
+            if dynModel then sim.setJointTargetPosition(joints[j], val)
+            else sim.setJointPosition(joints[j], val)
+            end
+        end
+        sim.step()
+    end
+
+    sim.setStepping(lb)
+end
+
+function generatePathTo(targetPos, simBase, simTip, simGoal, simJoints)
+    sim.setObjectPosition(simGoal, -1, targetPos)
+
+    local ikEnv = simIK.createEnvironment()
+    local ikGroup = simIK.createGroup(ikEnv)
+    local ikElement, map = simIK.addElementFromScene(ikEnv, ikGroup, simBase, simTip, simGoal, simIK.constraint_position)
+
+    local ikTip = map[simTip]
+    local ikJ = {}
+    for i=1,#simJoints do ikJ[i] = map[simJoints[i]] end
+
+    local path = simIK.generatePath(ikEnv, ikGroup, ikJ, ikTip, 300)
+    simIK.eraseEnvironment(ikEnv)
+
+    return path
+end
+
+function grasp(left_sensor, right_sensor)
+    while true do
+        local ldetect = sim.readProximitySensor(left_sensor)
+        local rdetect = sim.readProximitySensor(right_sensor)
+        
+        if ldetect > 0 and rdetect > 0 then
+            sim.addStatusbarMessage('[Robot3] Grasped fuel rod')
+            sim.setInt32Signal('robot1_grabbed',1)
+            return true
+        end
+        sim.wait(0.05)
+    end
+end
+
+function receptacle_holes()
+    local h1_sensor = sim.getObject('/receptacle_sensor_h1')
+    local h2_sensor = sim.getObject('/receptacle_sensor_h2')
+    local h3_sensor = sim.getObject('/receptacle_sensor_h3')
+    local h4_sensor = sim.getObject('/receptacle_sensor_h4')
+    
+    local r1 = sim.readProximitySensor(h1_sensor)
+    local r2 = sim.readProximitySensor(h2_sensor)
+    local r3 = sim.readProximitySensor(h3_sensor)
+    local r4 = sim.readProximitySensor(h4_sensor)
+    
+    local receptacle = sim.getObject('/Receptacle')
+    local receptaclePos = sim.getObjectPosition(receptacle, -1)
+    local hole1 = {receptaclePos[1], receptaclePos[2] + 0.010, receptaclePos[3] - 0.12972}
+    local hole2 = {1.560, 0.265, 0.20472}
+    local hole3 = {1.490, 0.265, 0.20472}
+    local hole4 = {1.535, 0.225, 0.20472}
+    
+    if r1 == 0 then 
+        sim.addStatusbarMessage('[Robot3] Hole H1 is empty. Moving to H1')
+        return hole1 
+    else
+        sim.addStatusbarMessage('[Robot3] Hole H1 is occupied')
+    end
+    
+    if r2 == 0 then 
+        sim.addStatusbarMessage('[Robot3] Hole H2 is empty. Moving to H2')
+        return hole2 
+    else
+        sim.addStatusbarMessage('[Robot3] Hole H2 is occupied')
+    end
+    
+    if r3 == 0 then 
+        sim.addStatusbarMessage('[Robot3] Hole H3 is empty. Moving to H3')
+        return hole3 
+    else
+        sim.addStatusbarMessage('[Robot3] Hole H3 is occupied')
+    end
+    
+    if r4 == 0 then 
+        sim.addStatusbarMessage('[Robot3] Hole H4 is empty. Moving to H4')
+        return hole4 
+    else
+        sim.addStatusbarMessage('[Robot3] Hole H4 is occupied')
+    end
+    
+    sim.setIntegerSignal("stop_robot1", 1)
+    return nil
+end
+    
+
+function sysCall_thread()
+    local simBase = sim.getObject('..')
+    local simTip = sim.getObject('/robot3/NiryoLGripper/tip')
+    local simGoal = sim.getObject('/dummy[1]')
+
+    local simJoints = {}
+    for i=1,6 do
+        simJoints[i] = sim.getObject('../Joint', {index=i-1})
+    end
+
+    local connection = sim.getObject('../connection')
+    local gripper = sim.getObjectChild(connection, 0)
+    local gripperName = (gripper ~= -1) and sim.getObjectAlias(gripper,4) or 'NiryoNoGripper'
+    
+    local leftSensor = sim.getObject('/robot3/NiryoLGripper/leftSensor')
+    local rightSensor = sim.getObject('/robot3/NiryoLGripper/rightSensor')
+    
+    while sim.getIntegerSignal('third_robot') ~= 1 do
+        sim.wait(0.05)
+    end
+    
+    local fuelRod = sim.getObject('/fuelRod')
+    local rodPos = sim.getObjectPosition(fuelRod, -1)
+    local graspPos = {rodPos[1] + 0.1381, rodPos[2] - 0.01107, rodPos[3] - 0.01478}
+
+    sim.step()
+    local dynModel = sim.isDynamicallyEnabled(simJoints[1])
+    
+    local PathA = generatePathTo(graspPos, simBase, simTip, simGoal, simJoints)
+    hopThroughConfigs(PathA, simJoints, false, dynModel)
+    
+    sim.setInt32Signal(gripperName .. '_close', 1)
+    sim.wait(10)
+    grasp(leftSensor, rightSensor)
+    sim.setIntegerSignal('third_robot_grabbed', 1)
+    sim.wait(2)
+    local path2 = generatePathTo({1.5257, 0.27508, 0.35782},simBase, simTip, simGoal, simJoints)
+    hopThroughConfigs(path2, simJoints, false, dynModel)
+    
+    local targetHole = receptacle_holes()
+    if targetHole then
+        local holePath = generatePathTo(targetHole, simBase, simTip, simGoal, simJoints)
+        hopThroughConfigs(holePath, simJoints, false, dynModel)
+        sim.clearInt32Signal(gripperName..'_close')
+    else
+        sim.addStatusbarMessage('[Robot3] All receptable holes are occupied')
+    end
+    
+    sim.clearInt32Signal(gripperName..'_close')
+    local path4 = generatePathTo({1.5257, 0.27508, 0.35782},simBase, simTip, simGoal, simJoints)
+    hopThroughConfigs(path4, simJoints, false, dynModel)
+
+    
+
+
+
+end
